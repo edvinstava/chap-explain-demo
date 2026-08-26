@@ -77,7 +77,7 @@ splits) never overwrite: later sidecars get `_2`, `_3`, ... suffixes.
 uv run --group plots python plots.py <run_dir>   # e.g. runs/chap_explain_demo/latest
 ```
 
-renders, from the tidy CSV alone:
+renders, from the tidy CSV alone, the lean default chart set:
 
 - **Local "why this month"** - the predicted-peak month per location, as a
   2x2 grid (SHAP/LIME x lagged/original views) of signed contribution bars.
@@ -85,13 +85,34 @@ renders, from the tidy CSV alone:
   methods.
 - **Contributions over time** - stacked monthly SHAP contributions per
   covariate with the prediction line on top, per location.
-- **Intervention focus** - intervention coverage (auto-detected extra
-  covariates such as `spray_coverage`) against its own contribution.
+
+Filters keep the output small enough to hand to study participants. To limit
+the visualizations to a **single location**, pass its name to `--locations`;
+every chart family is then rendered for that location only:
+
+```bash
+python plots.py <run_dir> --locations Bokeo             # one location only
+python plots.py <run_dir> --locations Bokeo,Vientiane   # or a few
+python plots.py <run_dir> --periods 2023-10,2023-11     # only these months
+python plots.py <run_dir> --charts local,over_time      # only these families
+python plots.py <run_dir> --charts intervention         # opt-in: coverage vs. effect
+```
+
+Filters combine, so `--locations Bokeo --charts local` yields exactly one
+chart. Unknown location or period names fail with the list of available
+values.
+
+`--charts` accepts `local`, `global`, `over_time`, and `intervention`.
+**Intervention focus** charts (auto-detected extra covariates such as
+`spray_coverage` against their own contribution) are not rendered by default -
+request them with `--charts intervention`.
 
 Each chart is written as a print-ready PNG (`plots/png/`) and as a Highcharts
 config JSON plus a self-contained `plots/highcharts/index.html`. Signed
 contributions follow the SHAP convention: red pushes the prediction up, blue
-pushes it down.
+pushes it down. Interactive chart tooltips show the covariate value behind
+each contribution on hover (per lag where the lagged values differ, collapsed
+to a single value where they do not).
 
 ## Counterfactual analysis (CHAP built-in)
 
@@ -113,20 +134,39 @@ as a third, perturbation-based explanation method.
 
 ## Run as a service with chapkit
 
-The same repository runs unmodified as a REST service via
-[chapkit](https://github.com/dhis2-chap/chapkit)'s MLproject runner. chapkit
-does not activate the model's environment itself, so launch it from inside
-this project's environment (Python 3.13, matching chapkit's requirement):
+`main.py` wraps the same train/predict scripts as a
+[chapkit](https://github.com/dhis2-chap/chapkit) REST service with full model
+metadata. chapkit does not activate the model's environment itself, so launch
+it from inside this project's environment (Python 3.13, matching chapkit's
+requirement):
 
 ```bash
 uv sync
-uv run --with chapkit chapkit mlproject run . --port 9090
+uv run --with chapkit python main.py
 ```
 
 Train/predict then run as async jobs (`POST /api/v1/ml/$train`,
 `POST /api/v1/ml/$predict`); the prediction workspace artifact
 (`GET /api/v1/artifacts/{id}/$download`) contains `predictions.csv` together
 with the explanation sidecar files.
+
+To surface the model in a running chap-core (and the DHIS2 Modeling App),
+start the service with self-registration enabled (single quotes: `$register`
+is literal):
+
+```bash
+SERVICEKIT_ORCHESTRATOR_URL='http://localhost:8000/v2/services/$register' \
+SERVICEKIT_HOST=host.docker.internal \
+SERVICEKIT_PORT=9090 \
+uv run --with chapkit python main.py
+```
+
+`SERVICEKIT_HOST` is the address chap-core calls back on; from Docker
+containers on the same machine that is `host.docker.internal`. The service
+registers on startup and pings chap-core once a minute to stay listed, so
+keep it running while using the model. (The bare
+`chapkit mlproject run . --port 9090` runner still works for local REST use,
+but serves no model metadata, so chap-core cannot register it.)
 
 ## Development
 
