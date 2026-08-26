@@ -14,6 +14,7 @@ Color roles (validated palette, see repository README):
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 
 import matplotlib
@@ -38,6 +39,10 @@ _EXTRA_COLORS = ["#1baf7a", "#008300", "#4a3aa7", "#e34948"]
 
 KNOWN_BASE_FEATURES = set(_ROLE_COLORS) | {"rainfall", "mean_temperature"}
 
+CHART_FAMILIES = ("local", "global", "over_time", "intervention")
+# Lean default for study participants; intervention charts are opt-in.
+DEFAULT_CHARTS = ("local", "global", "over_time")
+
 
 def covariate_colors(base_features: list[str]) -> dict[str, str]:
     colors = {}
@@ -50,17 +55,47 @@ def covariate_colors(base_features: list[str]) -> dict[str, str]:
     return colors
 
 
-def display_name(feature: str, lag: float) -> str:
-    label = feature.replace("_", " ").capitalize()
-    if pd.isna(lag):
-        return label
-    lag = int(lag)
-    base = feature.rsplit("_lag_", 1)[0].replace("_", " ").capitalize()
+def _lag_phrase(lag: int) -> str:
     if lag == 0:
-        return f"{base} (this month)"
+        return "this month"
     if lag == 1:
-        return f"{base} (1 month earlier)"
-    return f"{base} ({lag} months earlier)"
+        return "1 month earlier"
+    return f"{lag} months earlier"
+
+
+def display_name(feature: str, lag: float) -> str:
+    if pd.isna(lag):
+        return feature.replace("_", " ").capitalize()
+    base = feature.rsplit("_lag_", 1)[0].replace("_", " ").capitalize()
+    return f"{base} ({_lag_phrase(int(lag))})"
+
+
+def format_value(value: float) -> str:
+    """Compact feature value for tooltips: 1 decimal, whole cases above 1000."""
+    if pd.isna(value):
+        return ""
+    if abs(value) >= 1000:
+        return f"{math.floor(value + 0.5):,}"
+    return f"{value:,.1f}"
+
+
+def value_detail(lagged_rows: pd.DataFrame) -> str:
+    """Tooltip text for the feature value(s) behind one contribution.
+
+    A value shared across lags (e.g. population) collapses to "value: x";
+    distinct per-lag values get the full per-lag breakdown.
+    """
+    rows = lagged_rows.sort_values("lag")
+    if rows.feature_value.nunique(dropna=False) <= 1:
+        return f"value: {format_value(rows.feature_value.iloc[0])}"
+    parts = []
+    for row in rows.itertuples():
+        if pd.isna(row.lag):
+            phrase = display_name(row.feature, row.lag)
+        else:
+            phrase = _lag_phrase(int(row.lag))
+        parts.append(f"{phrase} {format_value(row.feature_value)}")
+    return ", ".join(parts)
 
 
 def find_explanations_file(path: Path) -> Path:
@@ -75,6 +110,22 @@ def find_explanations_file(path: Path) -> Path:
 def load_explanations(path: Path) -> pd.DataFrame:
     tidy = pd.read_csv(find_explanations_file(path))
     tidy["condition"] = tidy["condition"].fillna("")
+    return tidy
+
+
+def filter_explanations(
+    tidy: pd.DataFrame,
+    locations: list[str] | None = None,
+    periods: list[str] | None = None,
+) -> pd.DataFrame:
+    for column, wanted in (("location", locations), ("time_period", periods)):
+        if not wanted:
+            continue
+        available = sorted(tidy[column].unique())
+        unknown = sorted(set(wanted) - set(available))
+        if unknown:
+            raise ValueError(f"Unknown {column} value(s) {unknown}; available: {available}")
+        tidy = tidy[tidy[column].isin(wanted)]
     return tidy
 
 
@@ -146,6 +197,13 @@ def local_highcharts(tidy: pd.DataFrame, location: str, period: str) -> dict[str
     rows = tidy[(tidy.location == location) & (tidy.time_period == period)]
     charts = {}
     for method in ["shap", "lime"]:
+        lagged_rows = rows[(rows.method == method) & (rows.view == "lagged")]
+
+        def detail(row, lagged_rows=lagged_rows):
+            if row.view == "lagged":
+                return f"value: {format_value(row.feature_value)}"
+            return value_detail(lagged_rows[lagged_rows.base_feature == row.base_feature])
+
         for view in ["lagged", "base"]:
             panel = rows[(rows.method == method) & (rows.view == view)]
             prediction = panel.prediction.iloc[0]
@@ -153,15 +211,30 @@ def local_highcharts(tidy: pd.DataFrame, location: str, period: str) -> dict[str
             view_label = "lagged features" if view == "lagged" else "original covariates"
             if method == "shap":
                 panel = panel.sort_values("contribution", key=abs, ascending=False)
-                data = [{"name": "Baseline", "y": round(float(baseline), 1), "color": NEUTRAL}]
+                data = [
+                    {
+                        "name": "Baseline",
+                        "y": round(float(baseline), 1),
+                        "color": NEUTRAL,
+                        "custom": {"detail": ""},
+                    }
+                ]
                 data += [
                     {
                         "name": display_name(row.feature, row.lag),
                         "y": round(float(row.contribution), 1),
+                        "custom": {"detail": detail(row)},
                     }
                     for row in panel.itertuples()
                 ]
-                data.append({"name": "Prediction", "isSum": True, "color": NEUTRAL})
+                data.append(
+                    {
+                        "name": "Prediction",
+                        "isSum": True,
+                        "color": NEUTRAL,
+                        "custom": {"detail": ""},
+                    }
+                )
                 config = {
                     "chart": {"type": "waterfall"},
                     "title": {"text": f"SHAP ({view_label}): {location} {period}"},
@@ -169,7 +242,9 @@ def local_highcharts(tidy: pd.DataFrame, location: str, period: str) -> dict[str
                     "xAxis": {"type": "category"},
                     "yAxis": {"title": {"text": "Predicted cases"}},
                     "legend": {"enabled": False},
-                    "tooltip": {"pointFormat": "<b>{point.y:,.1f}</b> cases"},
+                    "tooltip": {
+                        "pointFormat": "<b>{point.y:,.1f}</b> cases<br/>{point.custom.detail}"
+                    },
                     "series": [
                         {
                             "upColor": POSITIVE,
@@ -197,15 +272,16 @@ def local_highcharts(tidy: pd.DataFrame, location: str, period: str) -> dict[str
                     },
                     "yAxis": {"title": {"text": "Weight (cases)"}},
                     "legend": {"enabled": False},
-                    "tooltip": {"pointFormat": "<b>{point.y:,.1f}</b>"},
+                    "tooltip": {"pointFormat": "<b>{point.y:,.1f}</b><br/>{point.custom.detail}"},
                     "series": [
                         {
                             "data": [
                                 {
-                                    "y": round(float(c), 1),
-                                    "color": POSITIVE if c > 0 else NEGATIVE,
+                                    "y": round(float(row.contribution), 1),
+                                    "color": POSITIVE if row.contribution > 0 else NEGATIVE,
+                                    "custom": {"detail": detail(row)},
                                 }
-                                for c in panel.contribution
+                                for row in panel.itertuples()
                             ],
                             "dataLabels": {"enabled": True, "format": "{point.y:,.0f}"},
                         }
@@ -328,6 +404,7 @@ def plot_over_time(tidy: pd.DataFrame, location: str, out: Path) -> None:
 
 def over_time_highcharts(tidy: pd.DataFrame, location: str) -> dict[str, dict]:
     rows = tidy[(tidy.method == "shap") & (tidy.view == "base") & (tidy.location == location)]
+    lagged = tidy[(tidy.method == "shap") & (tidy.view == "lagged") & (tidy.location == location)]
     pivot = rows.pivot_table(index="time_period", columns="base_feature", values="contribution")
     predictions = rows.groupby("time_period")["prediction"].first()
     baseline = float(rows.baseline.iloc[0])
@@ -337,7 +414,24 @@ def over_time_highcharts(tidy: pd.DataFrame, location: str) -> dict[str, dict]:
             "type": "column",
             "name": display_name(feature, float("nan")),
             "color": colors[feature],
-            "data": [round(float(v), 1) for v in pivot[feature]],
+            "data": [
+                {
+                    "y": round(float(pivot.loc[period, feature]), 1),
+                    "custom": {
+                        "detail": value_detail(
+                            lagged[
+                                (lagged.time_period == period) & (lagged.base_feature == feature)
+                            ]
+                        )
+                    },
+                }
+                for period in pivot.index
+            ],
+            "tooltip": {
+                "pointFormat": (
+                    "{series.name}: <b>{point.y:,.1f}</b> cases ({point.custom.detail})<br/>"
+                )
+            },
         }
         for feature in pivot.columns
     ]
@@ -442,12 +536,20 @@ def intervention_highcharts(tidy: pd.DataFrame, location: str, covariate: str) -
             "xAxis": {"categories": periods},
             "yAxis": {"title": {"text": "SHAP contribution (cases)"}},
             "legend": {"enabled": False},
-            "tooltip": {"pointFormat": "<b>{point.y:,.1f}</b> cases"},
+            "tooltip": {"pointFormat": "<b>{point.y:,.1f}</b> cases<br/>{point.custom.detail}"},
             "series": [
                 {
                     "data": [
-                        {"y": round(float(c), 1), "color": POSITIVE if c > 0 else NEGATIVE}
-                        for c in contributions
+                        {
+                            "y": round(float(c), 1),
+                            "color": POSITIVE if c > 0 else NEGATIVE,
+                            "custom": {
+                                "detail": (
+                                    f"coverage: {format_value(coverage.get(period, float('nan')))}"
+                                )
+                            },
+                        }
+                        for period, c in contributions.items()
                     ],
                     "dataLabels": {"enabled": True, "format": "{point.y:,.0f}"},
                 }
@@ -498,45 +600,58 @@ for (const [name, config] of Object.entries(CHARTS)) {{
 """
 
 
-def render_all(tidy: pd.DataFrame, importance: pd.DataFrame, out_dir: Path) -> list[Path]:
+def render_all(
+    tidy: pd.DataFrame,
+    importance: pd.DataFrame,
+    out_dir: Path,
+    charts: list[str] | tuple[str, ...] = DEFAULT_CHARTS,
+) -> list[Path]:
+    unknown = sorted(set(charts) - set(CHART_FAMILIES))
+    if unknown:
+        raise ValueError(f"Unknown chart(s) {unknown}; available: {list(CHART_FAMILIES)}")
+    families = set(charts)
+
     png_dir = out_dir / "png"
     hc_dir = out_dir / "highcharts"
     png_dir.mkdir(parents=True, exist_ok=True)
     hc_dir.mkdir(parents=True, exist_ok=True)
 
     written: list[Path] = []
-    charts: dict[str, dict] = {}
+    configs: dict[str, dict] = {}
 
-    peaks = peak_periods(tidy)
-    for location, period in peaks.items():
-        path = png_dir / f"local_{location}_{period}.png"
-        plot_local(tidy, location, period, path)
-        written.append(path)
-        charts.update(local_highcharts(tidy, location, period))
-
-    path = png_dir / "global_importance.png"
-    plot_global_importance(importance, path)
-    written.append(path)
-    charts.update(global_importance_highcharts(importance))
-
-    for location in sorted(tidy.location.unique()):
-        path = png_dir / f"over_time_{location}.png"
-        plot_over_time(tidy, location, path)
-        written.append(path)
-        charts.update(over_time_highcharts(tidy, location))
-
-    for covariate in detect_intervention_covariates(tidy):
-        for location in sorted(tidy.location.unique()):
-            path = png_dir / f"intervention_{location}_{covariate}.png"
-            plot_intervention(tidy, location, covariate, path)
+    if "local" in families:
+        for location, period in peak_periods(tidy).items():
+            path = png_dir / f"local_{location}_{period}.png"
+            plot_local(tidy, location, period, path)
             written.append(path)
-            charts.update(intervention_highcharts(tidy, location, covariate))
+            configs.update(local_highcharts(tidy, location, period))
 
-    for name, config in charts.items():
+    if "global" in families:
+        path = png_dir / "global_importance.png"
+        plot_global_importance(importance, path)
+        written.append(path)
+        configs.update(global_importance_highcharts(importance))
+
+    if "over_time" in families:
+        for location in sorted(tidy.location.unique()):
+            path = png_dir / f"over_time_{location}.png"
+            plot_over_time(tidy, location, path)
+            written.append(path)
+            configs.update(over_time_highcharts(tidy, location))
+
+    if "intervention" in families:
+        for covariate in detect_intervention_covariates(tidy):
+            for location in sorted(tidy.location.unique()):
+                path = png_dir / f"intervention_{location}_{covariate}.png"
+                plot_intervention(tidy, location, covariate, path)
+                written.append(path)
+                configs.update(intervention_highcharts(tidy, location, covariate))
+
+    for name, config in configs.items():
         path = hc_dir / f"{name}.json"
         path.write_text(json.dumps(config, indent=2))
         written.append(path)
     index = hc_dir / "index.html"
-    index.write_text(_HTML_TEMPLATE.format(charts_json=json.dumps(charts)))
+    index.write_text(_HTML_TEMPLATE.format(charts_json=json.dumps(configs)))
     written.append(index)
     return written
