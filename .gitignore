@@ -6,4 +6,7 @@ __pycache__/
 runs/
 output/
 counterfactual_output/
+results/*
+!results/.gitkeep
 .DS_Store
+data/
